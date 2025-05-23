@@ -138,7 +138,7 @@
     </div>
 
     <script>
-        const API_BASE = '/api';  // Use relative URL for Docker setup
+        const API_BASE = 'http://localhost:8000/api/api';  // Use relative URL for Docker setup
         const AUTH_TOKEN = 'demo-token-123';
         let currentLogs = [];
         let selectedLogIds = [];
@@ -159,12 +159,12 @@
 
         async function checkSystemStatus() {
             try {
-                const response = await fetch('/health');
+                const response = await fetch('http://localhost:8000/health');
                 const data = await response.json();
                 document.getElementById('statusDisplay').innerHTML = `
                     <div class="alert alert-success">
                         ✅ System Status: ${data.api}<br>
-                        📊 Storage: ${data.storage_type}<br>
+                        📊 Database Status: ${data.database}<br> // Changed from data.storage_type
                         🕐 Last Check: ${new Date().toLocaleTimeString()}
                     </div>
                 `;
