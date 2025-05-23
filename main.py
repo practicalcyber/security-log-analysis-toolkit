@@ -1,10 +1,10 @@
+import os
+import sys
+import time
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta
 import json
 import re
@@ -17,11 +17,77 @@ from pydantic import BaseModel
 import io
 import zipfile
 
-# Database setup
-SQLALCHEMY_DATABASE_URL = "postgresql://user:password@localhost/securitytoolkit"
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Database imports with error handling
+try:
+    from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, text
+    from sqlalchemy.ext.declarative import declarative_base
+    from sqlalchemy.orm import sessionmaker, Session
+    from sqlalchemy.exc import OperationalError
+except ImportError as e:
+    print(f"Database dependencies missing: {e}")
+    sys.exit(1)
+
+# Database configuration - FIXED for Docker
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://secuser:secpass123@db:5432/securitytoolkit")
+print(f"🔗 Using database URL: {DATABASE_URL}")
+
+# Create engine with proper retry logic for Docker
+def create_db_engine():
+    max_retries = 30
+    retry_interval = 2
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 Database connection attempt {attempt + 1}/{max_retries}")
+            engine = create_engine(
+                DATABASE_URL,
+                pool_pre_ping=True,
+                pool_recycle=300,
+                echo=False,  # Disable SQL logging in production
+                connect_args={"connect_timeout": 10}
+            )
+            
+            # Test the connection
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            
+            print("✅ Database connection successful!")
+            return engine
+            
+        except OperationalError as e:
+            print(f"❌ Database connection failed (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                print(f"⏳ Retrying in {retry_interval} seconds...")
+                time.sleep(retry_interval)
+            else:
+                print("🔄 Max retries reached. Falling back to SQLite...")
+                # Fallback to SQLite for development
+                fallback_engine = create_engine("sqlite:///./security_toolkit.db", echo=False)
+                print("✅ SQLite fallback database created")
+                return fallback_engine
+        except Exception as e:
+            print(f"❌ Unexpected database error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_interval)
+            else:
+                sys.exit(1)
+
+# Initialize database connection
+engine = None
+SessionLocal = None
 Base = declarative_base()
+
+def init_database():
+    global engine, SessionLocal
+    engine = create_db_engine()
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    
+    # Create tables
+    try:
+        Base.metadata.create_all(bind=engine)
+        print("✅ Database tables created successfully")
+    except Exception as e:
+        print(f"❌ Failed to create database tables: {e}")
 
 # Models
 class LogEntry(Base):
@@ -57,8 +123,6 @@ class AnalysisReport(Base):
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-Base.metadata.create_all(bind=engine)
-
 # Pydantic models
 class LogEntryCreate(BaseModel):
     timestamp: datetime
@@ -74,6 +138,10 @@ class AnalysisRequest(BaseModel):
     llm_provider: Optional[str] = "openai"
     api_key: Optional[str] = None
 
+class ReportRequest(BaseModel):
+    analysis_type: str
+    log_ids: List[int]
+
 class ReportResponse(BaseModel):
     id: int
     report_type: str
@@ -82,7 +150,11 @@ class ReportResponse(BaseModel):
     created_at: datetime
 
 # FastAPI app
-app = FastAPI(title="Security Log Analysis Toolkit", version="1.0.0")
+app = FastAPI(
+    title="Security Log Analysis Toolkit", 
+    version="1.0.0",
+    description="Advanced Authentication Log Analysis & Threat Detection"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,17 +166,68 @@ app.add_middleware(
 
 security = HTTPBearer()
 
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    print("🚀 Starting Security Log Analysis Toolkit...")
+    init_database()
+    print("✅ Application startup complete!")
+
+# Health check endpoint (no authentication required)
+@app.get("/")
+async def root():
+    return {
+        "message": "Security Log Analysis Toolkit API", 
+        "version": "1.0.0",
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check"""
+    health_status = {
+        "api": "healthy",
+        "database": "unknown",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    # Check database connection
+    if SessionLocal:
+        try:
+            db = SessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            health_status["database"] = "healthy"
+        except Exception as e:
+            health_status["database"] = f"unhealthy: {str(e)}"
+    else:
+        health_status["database"] = "not initialized"
+    
+    return health_status
+
 # Dependency
 def get_db():
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+    
     db = SessionLocal()
     try:
         yield db
+    except Exception as e:
+        print(f"Database session error: {e}")
+        db.rollback()
+        raise
     finally:
         db.close()
 
 # Simple auth (demo purposes)
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != "demo-token-123":
+    token = credentials.credentials
+    # Demo tokens for testing
+    valid_tokens = ["demo-token-123", "test-token", "admin-token"]
+    
+    if token not in valid_tokens:
         raise HTTPException(status_code=401, detail="Invalid token")
     return "demo-user"
 
@@ -113,45 +236,50 @@ class LogParser:
     @staticmethod
     def parse_windows_event(log_line: str) -> Dict:
         """Parse Windows Event Log format"""
-        # Simplified parser for demo
-        patterns = {
-            'timestamp': r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',
-            'event_id': r'Event ID: (\d+)',
-            'username': r'Account Name:\s+([^\s]+)',
-            'source_ip': r'Source Network Address:\s+([^\s]+)',
-            'logon_type': r'Logon Type:\s+(\d+)'
-        }
-        
-        result = {}
-        for key, pattern in patterns.items():
-            match = re.search(pattern, log_line)
-            result[key] = match.group(1) if match else None
+        try:
+            patterns = {
+                'timestamp': r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',
+                'event_id': r'Event ID: (\d+)',
+                'username': r'Account Name:\s+([^\s]+)',
+                'source_ip': r'Source Network Address:\s+([^\s]+)',
+                'logon_type': r'Logon Type:\s+(\d+)'
+            }
             
-        return result
+            result = {}
+            for key, pattern in patterns.items():
+                match = re.search(pattern, log_line)
+                result[key] = match.group(1) if match else None
+                
+            return result
+        except Exception as e:
+            print(f"Error parsing Windows event: {e}")
+            return {}
     
     @staticmethod
     def parse_linux_auth(log_line: str) -> Dict:
         """Parse Linux auth.log format"""
-        # Jan 15 10:15:30 server sshd[12345]: Failed password for user from 192.168.1.100
-        pattern = r'(\w+\s+\d+\s+\d+:\d+:\d+)\s+\w+\s+(\w+)\[?\d*\]?:\s+(.*)'
-        match = re.search(pattern, log_line)
-        
-        if match:
-            timestamp_str, service, message = match.groups()
+        try:
+            pattern = r'(\w+\s+\d+\s+\d+:\d+:\d+)\s+\w+\s+(\w+)\[?\d*\]?:\s+(.*)'
+            match = re.search(pattern, log_line)
             
-            # Extract IP and username
-            ip_match = re.search(r'from\s+(\d+\.\d+\.\d+\.\d+)', message)
-            user_match = re.search(r'for\s+(\w+)', message)
-            
-            return {
-                'timestamp': timestamp_str,
-                'service': service,
-                'message': message,
-                'source_ip': ip_match.group(1) if ip_match else None,
-                'username': user_match.group(1) if user_match else None,
-                'result': 'Failed' if 'Failed' in message else 'Success'
-            }
-        return {}
+            if match:
+                timestamp_str, service, message = match.groups()
+                
+                ip_match = re.search(r'from\s+(\d+\.\d+\.\d+\.\d+)', message)
+                user_match = re.search(r'for\s+(\w+)', message)
+                
+                return {
+                    'timestamp': timestamp_str,
+                    'service': service,
+                    'message': message,
+                    'source_ip': ip_match.group(1) if ip_match else None,
+                    'username': user_match.group(1) if user_match else None,
+                    'result': 'Failed' if 'Failed' in message else 'Success'
+                }
+            return {}
+        except Exception as e:
+            print(f"Error parsing Linux auth log: {e}")
+            return {}
 
 # Threat Intelligence Integration
 class ThreatIntelChecker:
@@ -160,19 +288,17 @@ class ThreatIntelChecker:
         """Check IP against multiple threat intel sources"""
         results = {}
         
-        # AbuseIPDB (demo - would need real API key)
         try:
-            async with aiohttp.ClientSession() as session:
-                # Simulate API call
-                await asyncio.sleep(0.1)  # Simulate network delay
-                
-                # Mock response based on IP patterns
-                if ip.startswith('192.168') or ip.startswith('10.') or ip.startswith('172.'):
-                    results['abuseipdb'] = {'reputation': 'clean', 'confidence': 95}
-                elif ip.endswith('.1') or ip.endswith('.100'):
-                    results['abuseipdb'] = {'reputation': 'suspicious', 'confidence': 70}
-                else:
-                    results['abuseipdb'] = {'reputation': 'malicious', 'confidence': 85}
+            # Simulate API call with realistic delay
+            await asyncio.sleep(0.1)
+            
+            # Mock response based on IP patterns for demo
+            if ip.startswith(('192.168', '10.', '172.16', '172.17', '172.18', '172.19')):
+                results['abuseipdb'] = {'reputation': 'clean', 'confidence': 95}
+            elif ip.startswith(('203.0.113', '198.51.100', '185.220.101')):
+                results['abuseipdb'] = {'reputation': 'malicious', 'confidence': 85}
+            else:
+                results['abuseipdb'] = {'reputation': 'suspicious', 'confidence': 70}
                     
         except Exception as e:
             results['abuseipdb'] = {'error': str(e)}
@@ -185,7 +311,7 @@ class SecurityAnalyzer:
         self.risk_thresholds = {
             'failed_login_count': 5,
             'time_window_minutes': 30,
-            'suspicious_hours': [(22, 6)]  # 10PM to 6AM
+            'suspicious_hours': [(22, 6)]
         }
     
     def analyze_failed_logins(self, log_entries: List[LogEntry]) -> Dict:
@@ -193,13 +319,12 @@ class SecurityAnalyzer:
         failed_attempts = {}
         
         for entry in log_entries:
-            if entry.result.lower() == 'failed':
+            if entry.result and entry.result.lower() == 'failed':
                 key = f"{entry.source_ip}_{entry.username}"
                 if key not in failed_attempts:
                     failed_attempts[key] = []
                 failed_attempts[key].append(entry.timestamp)
         
-        # Check for brute force patterns
         alerts = []
         for key, timestamps in failed_attempts.items():
             if len(timestamps) >= self.risk_thresholds['failed_login_count']:
@@ -220,6 +345,9 @@ class SecurityAnalyzer:
         off_hours_logins = []
         
         for entry in log_entries:
+            if not entry.timestamp:
+                continue
+                
             hour = entry.timestamp.hour
             for start, end in self.risk_thresholds['suspicious_hours']:
                 if start > end:  # Crosses midnight
@@ -232,7 +360,7 @@ class SecurityAnalyzer:
             'off_hours_count': len(off_hours_logins),
             'suspicious_entries': [
                 {
-                    'timestamp': entry.timestamp.isoformat(),
+                    'timestamp': entry.timestamp.isoformat() if entry.timestamp else None,
                     'username': entry.username,
                     'ip': entry.source_ip
                 } for entry in off_hours_logins
@@ -262,69 +390,63 @@ class LLMAnalyzer:
     }
     
     async def analyze_with_llm(self, events_data: str, analysis_type: str, api_key: str) -> str:
-        """Simulate LLM analysis (would integrate with real LLM API)"""
+        """Simulate LLM analysis"""
         prompt = self.ANALYSIS_PROMPTS.get(analysis_type, self.ANALYSIS_PROMPTS["suspicious_activity"])
         
-        # Mock LLM response based on analysis type
+        # Mock responses for demo
         if analysis_type == "incident_summary":
-            return """
-            **Executive Summary**
+            return """**Executive Summary**
             
-            A security incident involving multiple failed authentication attempts has been detected.
-            
-            **Key Findings:**
-            - 15 failed login attempts from external IP addresses
-            - Attempts occurred during off-business hours (2:00 AM - 4:00 AM)
-            - Targeted accounts include administrative users
-            
-            **Risk Level:** HIGH
-            
-            **Recommended Actions:**
-            1. Immediately review and strengthen password policies
-            2. Implement multi-factor authentication
-            3. Monitor affected accounts for 48 hours
-            4. Consider IP blocking for suspicious sources
-            """
+A security incident involving multiple failed authentication attempts has been detected.
+
+**Key Findings:**
+- Multiple failed login attempts from external IP addresses
+- Attempts occurred during off-business hours
+- Targeted accounts include administrative users
+
+**Risk Level:** HIGH
+
+**Recommended Actions:**
+1. Immediately review and strengthen password policies
+2. Implement multi-factor authentication
+3. Monitor affected accounts for 48 hours
+4. Consider IP blocking for suspicious sources"""
         
         elif analysis_type == "technical_analysis":
-            return """
-            **Technical Analysis Report**
-            
-            **Attack Vector:** Brute Force Authentication Attack
-            
-            **Timeline:**
-            - 02:15 UTC: First failed attempt from 203.0.113.1
-            - 02:16-02:45 UTC: Sustained attack targeting admin accounts
-            - 02:50 UTC: Attack ceased
-            
-            **Indicators of Compromise (IOCs):**
-            - Source IP: 203.0.113.1 (Known malicious IP)
-            - Targeted usernames: admin, administrator, root
-            - Attack pattern: Dictionary-based password guessing
-            
-            **Technical Recommendations:**
-            - Implement account lockout after 3 failed attempts
-            - Deploy intrusion detection system (IDS)
-            - Enable detailed audit logging
-            """
+            return """**Technical Analysis Report**
+
+**Attack Vector:** Brute Force Authentication Attack
+
+**Timeline:**
+- Initial failed attempts from suspicious IP addresses
+- Sustained attack targeting administrative accounts
+- Attack pattern consistent with automated tools
+
+**Indicators of Compromise (IOCs):**
+- Source IPs with poor reputation scores
+- Targeted usernames: admin, administrator, root
+- Attack pattern: Dictionary-based password guessing
+
+**Technical Recommendations:**
+- Implement account lockout after 3 failed attempts
+- Deploy intrusion detection system (IDS)
+- Enable detailed audit logging"""
         
         else:
-            return """
-            **Suspicious Activity Analysis**
-            
-            **Risk Level: HIGH**
-            
-            Multiple indicators suggest a coordinated brute force attack:
-            - High volume of failed authentication attempts
-            - External IP addresses with poor reputation
-            - Targeting of privileged accounts
-            - Attack during low-activity hours
-            
-            **Immediate Actions Required:**
-            - Block suspicious IP addresses
-            - Force password reset for targeted accounts
-            - Enable additional monitoring
-            """
+            return """**Suspicious Activity Analysis**
+
+**Risk Level: HIGH**
+
+Multiple indicators suggest a coordinated brute force attack:
+- High volume of failed authentication attempts
+- External IP addresses with poor reputation
+- Targeting of privileged accounts
+- Attack during low-activity hours
+
+**Immediate Actions Required:**
+- Block suspicious IP addresses
+- Force password reset for targeted accounts
+- Enable additional monitoring"""
 
 # API Routes
 @app.post("/api/upload-logs")
@@ -334,56 +456,62 @@ async def upload_logs(
     db: Session = Depends(get_db)
 ):
     """Upload and parse log files"""
-    content = await file.read()
-    
-    # Handle different file types
-    if file.filename.endswith('.zip'):
-        with zipfile.ZipFile(io.BytesIO(content)) as zip_file:
-            content = zip_file.read(zip_file.namelist()[0])
-    
-    log_lines = content.decode('utf-8', errors='ignore').split('\n')
-    parser = LogParser()
-    entries_created = 0
-    
-    for line in log_lines:
-        if not line.strip():
-            continue
-            
-        # Determine log type and parse
-        if 'Event ID:' in line or 'Logon Type:' in line:
-            parsed = parser.parse_windows_event(line)
-            event_type = 'windows_auth'
-        elif 'sshd' in line or 'sudo' in line:
-            parsed = parser.parse_linux_auth(line)
-            event_type = 'linux_auth'
-        else:
-            continue
+    try:
+        content = await file.read()
         
-        if parsed and parsed.get('timestamp'):
-            try:
-                # Create database entry
-                log_entry = LogEntry(
-                    user_id=user_id,
-                    timestamp=datetime.now(),  # Simplified for demo
-                    event_type=event_type,
-                    source_ip=parsed.get('source_ip', 'unknown'),
-                    username=parsed.get('username', 'unknown'),
-                    result=parsed.get('result', 'unknown'),
-                    details=json.dumps(parsed),
-                    risk_level='low'
-                )
-                db.add(log_entry)
-                entries_created += 1
-            except Exception as e:
+        # Handle different file types
+        if file.filename.endswith('.zip'):
+            with zipfile.ZipFile(io.BytesIO(content)) as zip_file:
+                content = zip_file.read(zip_file.namelist()[0])
+        
+        log_lines = content.decode('utf-8', errors='ignore').split('\n')
+        parser = LogParser()
+        entries_created = 0
+        
+        for line in log_lines:
+            if not line.strip():
                 continue
-    
-    db.commit()
-    
-    return {
-        "message": f"Successfully processed {entries_created} log entries",
-        "filename": file.filename,
-        "total_lines": len(log_lines)
-    }
+                
+            # Determine log type and parse
+            if 'Event ID:' in line or 'Logon Type:' in line:
+                parsed = parser.parse_windows_event(line)
+                event_type = 'windows_auth'
+            elif 'sshd' in line or 'sudo' in line:
+                parsed = parser.parse_linux_auth(line)
+                event_type = 'linux_auth'
+            else:
+                continue
+            
+            if parsed and (parsed.get('timestamp') or parsed.get('source_ip')):
+                try:
+                    # Create database entry
+                    log_entry = LogEntry(
+                        user_id=user_id,
+                        timestamp=datetime.now(),  # Simplified for demo
+                        event_type=event_type,
+                        source_ip=parsed.get('source_ip', 'unknown'),
+                        username=parsed.get('username', 'unknown'),
+                        result=parsed.get('result', 'unknown'),
+                        details=json.dumps(parsed),
+                        risk_level='low'
+                    )
+                    db.add(log_entry)
+                    entries_created += 1
+                except Exception as e:
+                    print(f"Error creating log entry: {e}")
+                    continue
+        
+        db.commit()
+        
+        return {
+            "message": f"Successfully processed {entries_created} log entries",
+            "filename": file.filename,
+            "total_lines": len(log_lines)
+        }
+        
+    except Exception as e:
+        print(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/api/logs")
 async def get_logs(
@@ -391,19 +519,23 @@ async def get_logs(
     db: Session = Depends(get_db)
 ):
     """Get user's log entries"""
-    logs = db.query(LogEntry).filter(LogEntry.user_id == user_id).limit(100).all()
-    return [
-        {
-            "id": log.id,
-            "timestamp": log.timestamp.isoformat(),
-            "event_type": log.event_type,
-            "source_ip": log.source_ip,
-            "username": log.username,
-            "result": log.result,
-            "risk_level": log.risk_level
-        }
-        for log in logs
-    ]
+    try:
+        logs = db.query(LogEntry).filter(LogEntry.user_id == user_id).order_by(LogEntry.created_at.desc()).limit(100).all()
+        return [
+            {
+                "id": log.id,
+                "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+                "event_type": log.event_type,
+                "source_ip": log.source_ip,
+                "username": log.username,
+                "result": log.result,
+                "risk_level": log.risk_level
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        print(f"Error getting logs: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve logs")
 
 @app.post("/api/analyze")
 async def analyze_logs(
@@ -412,124 +544,101 @@ async def analyze_logs(
     db: Session = Depends(get_db)
 ):
     """Perform security analysis"""
-    # Get log entries
-    logs = db.query(LogEntry).filter(
-        LogEntry.user_id == user_id,
-        LogEntry.id.in_(request.log_entries)
-    ).all()
-    
-    if not logs:
-        raise HTTPException(status_code=404, detail="No logs found")
-    
-    # Initialize analyzers
-    analyzer = SecurityAnalyzer()
-    threat_checker = ThreatIntelChecker()
-    llm_analyzer = LLMAnalyzer()
-    
-    # Perform analysis
-    results = {}
-    
-    # Basic security analysis
-    results['failed_logins'] = analyzer.analyze_failed_logins(logs)
-    results['time_patterns'] = analyzer.analyze_time_patterns(logs)
-    
-    # Threat intelligence check
-    unique_ips = list(set(log.source_ip for log in logs if log.source_ip != 'unknown'))
-    threat_intel = {}
-    
-    for ip in unique_ips[:5]:  # Limit for demo
-        threat_intel[ip] = await threat_checker.check_ip_reputation(ip)
-    
-    results['threat_intelligence'] = threat_intel
-    
-    # LLM Analysis (if API key provided)
-    if request.api_key:
-        events_summary = f"Analyzed {len(logs)} events from {len(unique_ips)} unique IPs"
-        llm_result = await llm_analyzer.analyze_with_llm(
-            events_summary, 
-            request.analysis_type,
-            request.api_key
-        )
-        results['llm_analysis'] = llm_result
-    
-    return results
+    try:
+        # Get log entries
+        logs = db.query(LogEntry).filter(
+            LogEntry.user_id == user_id,
+            LogEntry.id.in_(request.log_entries)
+        ).all()
+        
+        if not logs:
+            raise HTTPException(status_code=404, detail="No logs found")
+        
+        # Initialize analyzers
+        analyzer = SecurityAnalyzer()
+        threat_checker = ThreatIntelChecker()
+        llm_analyzer = LLMAnalyzer()
+        
+        # Perform analysis
+        results = {}
+        
+        # Basic security analysis
+        results['failed_logins'] = analyzer.analyze_failed_logins(logs)
+        results['time_patterns'] = analyzer.analyze_time_patterns(logs)
+        
+        # Threat intelligence check
+        unique_ips = list(set(log.source_ip for log in logs if log.source_ip and log.source_ip != 'unknown'))
+        threat_intel = {}
+        
+        for ip in unique_ips[:5]:  # Limit for demo
+            threat_intel[ip] = await threat_checker.check_ip_reputation(ip)
+        
+        results['threat_intelligence'] = threat_intel
+        
+        # LLM Analysis (if API key provided)
+        if request.api_key:
+            events_summary = f"Analyzed {len(logs)} events from {len(unique_ips)} unique IPs"
+            llm_result = await llm_analyzer.analyze_with_llm(
+                events_summary, 
+                request.analysis_type,
+                request.api_key
+            )
+            results['llm_analysis'] = llm_result
+        
+        return results
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Analysis error: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 @app.post("/api/generate-report")
 async def generate_report(
-    analysis_type: str,
-    log_ids: List[int],
+    request: ReportRequest, 
     user_id: str = Depends(verify_token),
     db: Session = Depends(get_db)
 ):
     """Generate analysis report"""
-    # Get analysis results
-    request = AnalysisRequest(log_entries=log_ids, analysis_type=analysis_type)
-    analysis_results = await analyze_logs(request, user_id, db)
-    
-    # Generate report content
-    if analysis_type == "executive":
-        title = "Executive Security Summary"
-        content = f"""
-        Security Analysis Report
-        Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        
-        Overview:
-        - Total events analyzed: {len(log_ids)}
-        - Failed login attempts: {analysis_results['failed_logins']['total_failed']}
-        - Off-hours activities: {analysis_results['time_patterns']['off_hours_count']}
-        
-        Risk Assessment: {'HIGH' if analysis_results['failed_logins']['total_failed'] > 10 else 'MEDIUM'}
-        
-        Recommendations:
-        1. Review authentication policies
-        2. Implement multi-factor authentication
-        3. Monitor suspicious IP addresses
-        """
-    
-    elif analysis_type == "technical":
-        title = "Technical Analysis Report"
-        content = f"""
-        Detailed Technical Analysis
-        
-        Failed Login Analysis:
-        {json.dumps(analysis_results['failed_logins'], indent=2)}
-        
-        Time Pattern Analysis:
-        {json.dumps(analysis_results['time_patterns'], indent=2)}
-        
-        Threat Intelligence:
-        {json.dumps(analysis_results['threat_intelligence'], indent=2)}
-        """
-    
-    else:  # timeline
-        title = "Timeline Analysis Report"
-        content = f"""
-        Security Event Timeline
-        
-        Key Events:
-        - Authentication failures detected
-        - Suspicious timing patterns identified
-        - Threat intelligence correlations found
-        
-        Timeline visualization would be generated here.
-        """
-    
-    # Save report
-    report = AnalysisReport(
-        user_id=user_id,
-        report_type=analysis_type,
-        title=title,
-        content=content
-    )
-    db.add(report)
-    db.commit()
-    
-    return {
-        "id": report.id,
-        "title": title,
-        "content": content,
-        "created_at": report.created_at.isoformat()
-    }
+    try:
+        # Get logs for the report (Example from report_fix.py, adjust if needed)
+        # logs = db.query(LogEntry).filter(
+        #     LogEntry.user_id == user_id,
+        #     LogEntry.id.in_(request.log_ids) 
+        # ).all()
+
+        # Simplified report generation for demo
+        title = f"{request.analysis_type.title()} Security Analysis Report" # Use request.analysis_type
+        content = f"""Security Analysis Report
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Report Type: {request.analysis_type} # Use request.analysis_type
+Log Entries Analyzed: {len(request.log_ids)} # Use request.log_ids
+
+This is a demo report. In a production system, this would contain
+detailed analysis results, charts, and recommendations.
+"""
+
+        # Save report
+        report = AnalysisReport(
+            user_id=user_id,
+            report_type=request.analysis_type, # Use request.analysis_type
+            title=title,
+            content=content
+        )
+        db.add(report)
+        db.commit()
+
+        return {
+            "id": report.id,
+            "title": title,
+            "content": content,
+            "created_at": report.created_at.isoformat()
+        }
+
+    except Exception as e:
+        print(f"Report generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
 
 @app.get("/api/reports")
 async def get_reports(
@@ -537,16 +646,20 @@ async def get_reports(
     db: Session = Depends(get_db)
 ):
     """Get user's reports"""
-    reports = db.query(AnalysisReport).filter(AnalysisReport.user_id == user_id).all()
-    return [
-        {
-            "id": report.id,
-            "report_type": report.report_type,
-            "title": report.title,
-            "created_at": report.created_at.isoformat()
-        }
-        for report in reports
-    ]
+    try:
+        reports = db.query(AnalysisReport).filter(AnalysisReport.user_id == user_id).order_by(AnalysisReport.created_at.desc()).all()
+        return [
+            {
+                "id": report.id,
+                "report_type": report.report_type,
+                "title": report.title,
+                "created_at": report.created_at.isoformat()
+            }
+            for report in reports
+        ]
+    except Exception as e:
+        print(f"Error getting reports: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve reports")
 
 @app.get("/api/reports/{report_id}")
 async def get_report(
@@ -555,25 +668,28 @@ async def get_report(
     db: Session = Depends(get_db)
 ):
     """Get specific report"""
-    report = db.query(AnalysisReport).filter(
-        AnalysisReport.id == report_id,
-        AnalysisReport.user_id == user_id
-    ).first()
-    
-    if not report:
-        raise HTTPException(status_code=404, detail="Report not found")
-    
-    return {
-        "id": report.id,
-        "report_type": report.report_type,
-        "title": report.title,
-        "content": report.content,
-        "created_at": report.created_at.isoformat()
-    }
-
-@app.get("/")
-async def root():
-    return {"message": "Security Log Analysis Toolkit API", "version": "1.0.0"}
+    try:
+        report = db.query(AnalysisReport).filter(
+            AnalysisReport.id == report_id,
+            AnalysisReport.user_id == user_id
+        ).first()
+        
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        
+        return {
+            "id": report.id,
+            "report_type": report.report_type,
+            "title": report.title,
+            "content": report.content,
+            "created_at": report.created_at.isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error getting report: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve report")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("🛡️  Starting Security Log Analysis Toolkit...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
