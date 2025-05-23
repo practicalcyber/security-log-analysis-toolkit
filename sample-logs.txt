@@ -1,0 +1,31 @@
+# Windows Event Logs Sample
+2024-01-15 08:15:30 Event ID: 4624 An account was successfully logged on Account Name: john.doe Source Network Address: 192.168.1.45 Logon Type: 2
+2024-01-15 08:16:42 Event ID: 4625 An account failed to log on Account Name: admin Source Network Address: 203.0.113.1 Logon Type: 3
+2024-01-15 08:16:45 Event ID: 4625 An account failed to log on Account Name: administrator Source Network Address: 203.0.113.1 Logon Type: 3
+2024-01-15 08:16:48 Event ID: 4625 An account failed to log on Account Name: root Source Network Address: 203.0.113.1 Logon Type: 3
+2024-01-15 08:16:51 Event ID: 4625 An account failed to log on Account Name: admin Source Network Address: 203.0.113.1 Logon Type: 3
+2024-01-15 08:16:54 Event ID: 4625 An account failed to log on Account Name: admin Source Network Address: 203.0.113.1 Logon Type: 3
+2024-01-15 09:22:10 Event ID: 4624 An account was successfully logged on Account Name: mary.smith Source Network Address: 192.168.1.87 Logon Type: 2
+2024-01-15 14:35:20 Event ID: 4648 A logon was attempted using explicit credentials Account Name: john.doe Target Account Name: admin Source Network Address: 192.168.1.45
+2024-01-15 23:45:15 Event ID: 4624 An account was successfully logged on Account Name: admin Source Network Address: 198.51.100.25 Logon Type: 10
+2024-01-15 23:46:30 Event ID: 4672 Special privileges assigned to new logon Account Name: admin
+2024-01-16 02:15:30 Event ID: 4625 An account failed to log on Account Name: backup Source Network Address: 185.220.101.1 Logon Type: 3
+2024-01-16 02:15:33 Event ID: 4625 An account failed to log on Account Name: backup Source Network Address: 185.220.101.1 Logon Type: 3
+2024-01-16 02:15:36 Event ID: 4625 An account failed to log on Account Name: service Source Network Address: 185.220.101.1 Logon Type: 3
+
+# Linux Auth Logs Sample
+Jan 15 08:15:30 webserver sshd[12345]: Accepted password for john from 192.168.1.45 port 22 ssh2
+Jan 15 08:16:42 webserver sshd[12346]: Failed password for admin from 203.0.113.1 port 22 ssh2
+Jan 15 08:16:45 webserver sshd[12347]: Failed password for administrator from 203.0.113.1 port 22 ssh2
+Jan 15 08:16:48 webserver sshd[12348]: Failed password for root from 203.0.113.1 port 22 ssh2
+Jan 15 08:16:51 webserver sshd[12349]: Failed password for admin from 203.0.113.1 port 22 ssh2
+Jan 15 08:16:54 webserver sshd[12350]: Failed password for admin from 203.0.113.1 port 22 ssh2
+Jan 15 09:22:10 webserver sshd[12351]: Accepted password for mary from 192.168.1.87 port 22 ssh2
+Jan 15 14:35:20 webserver sudo: john : TTY=pts/0 ; PWD=/home/john ; USER=root ; COMMAND=/bin/su admin
+Jan 15 23:45:15 webserver sshd[12352]: Accepted password for admin from 198.51.100.25 port 22 ssh2
+Jan 16 02:15:30 webserver sshd[12353]: Failed password for backup from 185.220.101.1 port 22 ssh2
+Jan 16 02:15:33 webserver sshd[12354]: Failed password for backup from 185.220.101.1 port 22 ssh2
+Jan 16 02:15:36 webserver sshd[12355]: Failed password for service from 185.220.101.1 port 22 ssh2
+Jan 16 07:30:15 webserver sshd[12356]: Accepted password for developer from 10.0.0.100 port 22 ssh2
+Jan 16 09:45:22 webserver sudo: developer : TTY=pts/1 ; PWD=/var/www ; USER=root ; COMMAND=/bin/systemctl restart nginx
+Jan 16 16:20:10 webserver sshd[12357]: Failed password for guest from 172.16.0.50 port 22 ssh2
